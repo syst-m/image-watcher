@@ -1,0 +1,37 @@
+# Deployment for the image-watcher service.
+# Runs in kube-system, polls GHCR every ~5 minutes for new image tags,
+# and triggers kubectl set image rollouts when newer images are detected.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: image-watcher
+  namespace: kube-system
+  labels:
+    app: image-watcher
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: image-watcher
+  template:
+    metadata:
+      labels:
+        app: image-watcher
+    spec:
+      serviceAccountName: image-watcher-sa
+      containers:
+      - name: watcher
+        image: ghcr.io/syst-m/image-watcher:latest
+        env:
+          - name: GITHUB_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: ghcr-pull-secret   # PAT with read:packages scope (already created in kube-system)
+                key: token
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 100m
+            memory: 128Mi

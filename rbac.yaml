@@ -1,0 +1,32 @@
+# RBAC for the image-watcher service.
+# The watcher runs in kube-system and needs to read/patch deployments
+# in the ai-api-gateway namespace. A ClusterRole is required because
+# the ServiceAccount lives in a different namespace.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: image-watcher-sa
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: image-watcher-role
+rules:
+# Only deployments in the apps API group — no Secrets, ConfigMaps, Services, etc.
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: image-watcher-binding
+subjects:
+- kind: ServiceAccount
+  name: image-watcher-sa
+  namespace: kube-system
+roleRef:
+  kind: ClusterRole
+  name: image-watcher-role
+  apiGroup: rbac.authorization.k8s.io
