@@ -143,10 +143,18 @@ func getCurrentImageTag(svc ServiceWatch) string {
 }
 
 // GHCRRegistryClient talks to the Docker Registry V2 API on ghcr.io.
+// GHCR requires the Docker Registry V2 auth flow: first request gets a 401
+// with WWW-Authenticate header containing a token exchange URL, then we
+// exchange our PAT for an OAuth bearer token and retry.
 type GHCRRegistryClient struct {
 	Token   string
 	BaseURL string // e.g. "https://ghcr.io/v2"
 	HTTP    *http.Client
+}
+
+// ghcrTokenResponse is the response from the GitHub token exchange endpoint.
+type ghcrTokenResponse struct {
+	Token string `json:"token"`
 }
 
 // NewGHCRRegistryClient returns a client configured for ghcr.io.
@@ -158,37 +166,123 @@ func NewGHCRRegistryClient(token string) *GHCRRegistryClient {
 	}
 }
 
-// ListTags returns all tag names for a container image repo.
-// Uses the Docker Registry V2 API: GET /v2/{scope}/tags/list?n=100
-func (c *GHCRRegistryClient) ListTags(owner, repo string) ([]string, error) {
-	scope := fmt.Sprintf("%s/%s", owner, repo)
-	url := fmt.Sprintf("%s/%s/tags/list?n=100", c.BaseURL, scope)
+// exchangeToken contacts the GitHub token exchange endpoint (realm from the
+// 401 challenge) and returns a short-lived OAuth token suitable for ghcr.io.
+func (c *GHCRRegistryClient) exchangeToken(realm, service, scope string) (string, error) {
+	exchangeURL := fmt.Sprintf("%s?scope=%s&service=%s", realm, scope, service)
 
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequest("GET", exchangeURL, nil)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.Token)
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("HTTP request to %s: %w", url, err)
+		return "", fmt.Errorf("token exchange request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
+	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("token exchange returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var tokenResp ghcrTokenResponse
+	if err := json.Unmarshal(body, &tokenResp); err != nil {
+		return "", fmt.Errorf("failed to parse token response: %w", err)
+	}
+	return tokenResp.Token, nil
+}
+
+// ListTags returns all tag names for a container image repo.
+// Uses the Docker Registry V2 API with GHCR's challenge-response auth flow.
+func (c *GHCRRegistryClient) ListTags(owner, repo string) ([]string, error) {
+	scope := fmt.Sprintf("%s/%s", owner, repo)
+	url := fmt.Sprintf("%s/%s/tags/list?n=100", c.BaseURL, scope)
+
+	// Step 1: Make the request without auth to get the challenge.
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("HTTP request to %s: %w", url, err)
+	}
+
+	// If we already have a cached token, use it directly.
+	if resp.StatusCode == http.StatusOK {
+		defer resp.Body.Close()
+		var result struct {
+			Name string   `json:"name"`
+			Tags []string `json:"tags"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			return nil, fmt.Errorf("failed to decode tags response: %w", err)
+		}
+		return result.Tags, nil
+	}
+	defer resp.Body.Close()
+
+	// Step 2: Parse the WWW-Authenticate header for token exchange details.
+	wwwAuth := resp.Header.Get("WWW-Authenticate")
+	realm, service, scopeParam := parseGHCRChallenge(wwwAuth)
+	if realm == "" {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("GHCR tags API returned status %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("GHCR returned %d without WWW-Authenticate: %s", resp.StatusCode, string(body))
+	}
+
+	// Step 3: Exchange our PAT for a GHCR OAuth token.
+	oauthToken, err := c.exchangeToken(realm, service, scopeParam)
+	if err != nil {
+		return nil, fmt.Errorf("token exchange failed: %w", err)
+	}
+
+	// Step 4: Retry the original request with the OAuth token.
+	req2, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req2.Header.Set("Authorization", "Bearer "+oauthToken)
+
+	resp2, err := c.HTTP.Do(req2)
+	if err != nil {
+		return nil, fmt.Errorf("HTTP request to %s: %w", url, err)
+	}
+	defer resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp2.Body)
+		return nil, fmt.Errorf("GHCR tags API returned status %d: %s", resp2.StatusCode, string(body))
 	}
 
 	var result struct {
 		Name string   `json:"name"`
 		Tags []string `json:"tags"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.NewDecoder(resp2.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("failed to decode tags response: %w", err)
 	}
 	return result.Tags, nil
+}
+
+// parseGHCRChallenge extracts realm, service, and scope from a
+// WWW-Authenticate: Bearer realm="...",service="...",scope="..." header.
+func parseGHCRChallenge(header string) (realm, service, scope string) {
+	// Simple parser: extract quoted values after key=
+	for _, part := range strings.Split(header, ",") {
+		part = strings.TrimSpace(part)
+		if strings.HasPrefix(part, `realm=`) {
+			realm = strings.Trim(strings.TrimPrefix(part, `realm=`), `"`)
+		} else if strings.HasPrefix(part, `service=`) {
+			service = strings.Trim(strings.TrimPrefix(part, `service=`), `"`)
+		} else if strings.HasPrefix(part, `scope=`) {
+			scope = strings.Trim(strings.TrimPrefix(part, `scope=`), `"`)
+		}
+	}
+	return
 }
 
 // pickNewestTag selects the most recent tag from a list, preferring semver tags (vX.Y.Z),
